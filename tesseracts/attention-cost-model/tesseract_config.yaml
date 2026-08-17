@@ -1,0 +1,34 @@
+name: "attention-cost-model"
+version: "0.1.0"
+description: |
+  Analytical I/O-complexity cost model for FlashAttention-style tiled
+  attention kernels. Given tile sizes (Br, Bc), a workload shape
+  (seq_len, head_dim, num_heads, batch_size), and a hardware descriptor
+  (sram_size_bytes, hbm_bandwidth_gb_s, compute_throughput_flops), predicts
+  kernel latency via a roofline model over HBM traffic and compute FLOPs,
+  gated by a hard (non-smooth) SRAM-capacity feasibility branch.
+
+  Implemented in C++ (src/cost_model.cpp), compiled to a shared library at
+  build time, and exposed with finite-difference gradients so the SRAM
+  branch does not need to be smoothed out for training a tiling policy
+  against it.
+
+build_config:
+  base_image: "debian:bookworm-slim"
+
+  # Compiler for the C++ cost model.
+  extra_packages:
+    - g++
+
+  # Copy the C++ source into the container.
+  package_data:
+    - ["src/cost_model.cpp", "src/cost_model.cpp"]
+    - ["src/cost_model.h", "src/cost_model.h"]
+
+  # Compile to a shared library that tesseract_api.py loads via ctypes.
+  custom_build_steps:
+    - |
+      RUN mkdir -p /tesseract/lib && \
+          g++ -O3 -fPIC -shared -std=c++17 \
+              -o /tesseract/lib/cost_model.so \
+              /tesseract/src/cost_model.cpp

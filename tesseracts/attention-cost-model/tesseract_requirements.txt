@@ -1,0 +1,2 @@
+# No extra Python dependencies -- tesseract_api.py only uses the stdlib
+# (ctypes) plus what tesseract_core.runtime already provides.
