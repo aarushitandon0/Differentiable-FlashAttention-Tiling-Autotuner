@@ -45,6 +45,17 @@ from policy.sample_workloads import (  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COST_MODEL_API_PATH = REPO_ROOT / "tesseracts" / "attention-cost-model" / "tesseract_api.py"
 
+# Rough per-sample cost-model evaluation count for the gradient method's
+# amortized training cost: 1 forward `apply` (already needed for the loss
+# value) + up to 2 evals per differentiable input for a central-difference
+# vector_jacobian_product (Br, Bc only -- the other Differentiable-marked
+# schema fields are never included in vjp_inputs during training, since JAX
+# only requests cotangents for inputs actually on the policy's
+# differentiation path). Used to report an amortized evaluation budget
+# and, with --checkpoint-every, to build the policy's own
+# evaluations-vs-latency curve in baselines/compare.py.
+EVALS_PER_TRAINING_SAMPLE = 1 + 2 * 2
+
 
 def make_cost_model_client() -> Tesseract:
     """Local (no-Docker) Tesseract client for fast iteration during
@@ -156,6 +167,15 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=100)
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Save a policy checkpoint every N steps, in addition to the "
+        "final one, so baselines/compare.py can plot the policy's own "
+        "evaluations-vs-latency curve over the course of training. 0 "
+        "(default) disables periodic checkpointing.",
+    )
     parser.add_argument("--decode-frac", type=float, default=0.4)
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "runs")
     args = parser.parse_args()
@@ -177,6 +197,16 @@ def main():
 
     loss_curve_path = run_dir / "loss_curve.csv"
     eval_predictions_path = run_dir / "eval_predictions.jsonl"
+
+    checkpoints_dir = run_dir / "checkpoints"
+    checkpoint_manifest_path = checkpoints_dir / "manifest.csv"
+    checkpoint_manifest_f = None
+    checkpoint_manifest_writer = None
+    if args.checkpoint_every > 0:
+        checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_manifest_f = open(checkpoint_manifest_path, "w", newline="")
+        checkpoint_manifest_writer = csv.writer(checkpoint_manifest_f)
+        checkpoint_manifest_writer.writerow(["step", "cumulative_evals", "checkpoint_path"])
 
     with open(loss_curve_path, "w", newline="") as loss_f:
         loss_writer = csv.writer(loss_f)
@@ -214,11 +244,23 @@ def main():
                     eval_f.write(json.dumps({"step": step, "predictions": predictions}) + "\n")
                     eval_f.flush()
 
+                if args.checkpoint_every > 0 and (step % args.checkpoint_every == 0 or step == args.steps):
+                    cumulative_evals = step * args.batch_size * EVALS_PER_TRAINING_SAMPLE
+                    ckpt_path = checkpoints_dir / f"step_{step:07d}.eqx"
+                    eqx.tree_serialise_leaves(ckpt_path, policy)
+                    checkpoint_manifest_writer.writerow([step, cumulative_evals, str(ckpt_path)])
+                    checkpoint_manifest_f.flush()
+
+    if checkpoint_manifest_f is not None:
+        checkpoint_manifest_f.close()
+
     checkpoint_path = run_dir / "policy_final.eqx"
     eqx.tree_serialise_leaves(checkpoint_path, policy)
     print(f"\nDone. Loss curve: {loss_curve_path}")
     print(f"Eval predictions over training: {eval_predictions_path}")
     print(f"Final policy checkpoint: {checkpoint_path}")
+    if args.checkpoint_every > 0:
+        print(f"Periodic checkpoints manifest: {checkpoint_manifest_path}")
 
 
 if __name__ == "__main__":

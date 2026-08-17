@@ -1,0 +1,18 @@
+# Core Tesseract stack
+tesseract-core[runtime]
+tesseract-jax
+
+# JAX training stack for the tiling policy (policy/)
+jax
+jaxlib
+equinox
+optax
+
+# Shared
+numpy
+
+# Plotting for baselines/compare.py
+matplotlib
+
+# Test suite (tests/)
+pytest

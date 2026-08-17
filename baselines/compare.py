@@ -41,18 +41,9 @@ from baselines.grid_search import TILE_GRID, best_latency_at_budget, grid_search
 from baselines.random_search import random_search_trace  # noqa: E402
 from policy.model import TilingPolicy  # noqa: E402
 from policy.sample_workloads import held_out_workloads  # noqa: E402
+from policy.train import EVALS_PER_TRAINING_SAMPLE  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-# Rough per-sample cost-model evaluation count for the gradient method's
-# amortized training cost, reported for transparency (not used as the
-# per-workload deployment budget, which is zero -- see module docstring):
-# 1 forward `apply` (already needed for the loss value) + up to 2 evals per
-# differentiable input for a central-difference vector_jacobian_product
-# (Br, Bc only -- the other Differentiable-marked schema fields are never
-# included in vjp_inputs during training, since JAX only requests
-# cotangents for inputs actually on the policy's differentiation path).
-EVALS_PER_TRAINING_SAMPLE = 1 + 2 * 2
 
 
 def load_policy(checkpoint_path: Path) -> TilingPolicy:
@@ -72,6 +63,16 @@ def training_evals_from_loss_curve(loss_curve_path: Path, batch_size: int) -> in
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoints-manifest",
+        type=Path,
+        default=None,
+        help="Optional path to a run's checkpoints/manifest.csv (written when "
+        "policy/train.py is run with --checkpoint-every > 0). If given, "
+        "evaluates every periodic checkpoint on the held-out set and plots "
+        "the policy's own mean-latency-vs-cumulative-training-evaluations "
+        "curve as training_progress.png, in addition to the main comparison.",
+    )
     parser.add_argument("--num-held-out", type=int, default=30)
     parser.add_argument("--random-seeds", type=int, default=5)
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "runs" / "compare")
@@ -146,6 +147,53 @@ def main():
         _plot(grid_curve, random_curve_mean, random_curve_std, policy_mean_latency, max_budget, args.out_dir)
     except ImportError:
         print("matplotlib not installed; skipping plot (results JSON is still written).")
+
+    if args.checkpoints_manifest is not None:
+        progress = evaluate_checkpoint_progress(args.checkpoints_manifest, client, workloads)
+        progress_path = args.out_dir / "training_progress.json"
+        with open(progress_path, "w") as f:
+            json.dump(progress, f, indent=2)
+        print(f"Training-progress results written to {progress_path}")
+        try:
+            _plot_training_progress(progress, args.out_dir)
+        except ImportError:
+            print("matplotlib not installed; skipping training-progress plot.")
+
+
+def evaluate_checkpoint_progress(manifest_path: Path, client, workloads) -> dict:
+    """Evaluate every periodic checkpoint listed in manifest_path on the
+    given held-out workloads, returning the policy's own mean-latency-vs-
+    cumulative-training-evaluations curve.
+    """
+    with open(manifest_path) as f:
+        rows = list(csv.DictReader(f))
+
+    cumulative_evals = []
+    mean_latencies = []
+    for row in rows:
+        policy = load_policy(Path(row["checkpoint_path"]))
+        latencies = []
+        for w in workloads:
+            br, bc = policy(jnp.asarray(w.to_feature_vector()))
+            latencies.append(evaluate_latency(client, w, float(br), float(bc)))
+        cumulative_evals.append(int(row["cumulative_evals"]))
+        mean_latencies.append(float(np.mean(latencies)))
+
+    return {"cumulative_evals": cumulative_evals, "mean_latency_us": mean_latencies}
+
+
+def _plot_training_progress(progress: dict, out_dir: Path):
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(progress["cumulative_evals"], progress["mean_latency_us"], marker="o", color="#54A24B")
+    ax.set_xlabel("Cumulative cost-model evaluations spent during training (amortized)")
+    ax.set_ylabel("Mean predicted latency on held-out workloads (us)")
+    ax.set_title("Policy training progress: amortized evaluations vs. held-out latency")
+    fig.tight_layout()
+    out_path = out_dir / "training_progress.png"
+    fig.savefig(out_path, dpi=150)
+    print(f"Training-progress plot written to {out_path}")
 
 
 def _plot(grid_curve, random_curve_mean, random_curve_std, policy_mean_latency, max_budget, out_dir):
