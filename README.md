@@ -184,6 +184,10 @@ tesseract-attn-autotune/
     throughput_compare.py           Policy recommendation + cost-model prediction alongside real measured throughput
     data/
       tinyshakespeare.txt            Training data (public domain)
+    gpu/                             Real GPU validation, requires CUDA (e.g. Colab), see below
+      triton_flash_attention.py       Causal FlashAttention forward kernel with configurable BLOCK_M/BLOCK_N
+      benchmark.py                    Real measured GPU latency vs. cost-model predicted latency
+      requirements-gpu.txt            Extra deps (torch, triton) on top of requirements.txt
   tests/
     conftest.py                    Puts the repo root on sys.path for `policy.*` / `baselines.*` imports
     test_sample_workloads.py       Workload sampler and evaluation set tests
@@ -192,6 +196,8 @@ tesseract-attn-autotune/
     test_baselines.py              Grid and random search baseline tests
     test_integration.py            End-to-end training loop and checkpoint-progress tests
     test_validation.py             Tiny GPT and policy-wiring tests for the Phase 5 demo
+    gpu/
+      test_triton_flash_attention.py  Correctness check for the Triton kernel; requires CUDA, run first
   docs/
     evals_vs_latency.png           Grid search vs. random search vs. trained policy, on held-out workloads
     training_progress.png          Policy's own mean held-out latency vs. cumulative training evaluations
@@ -466,9 +472,11 @@ behavior, not a validated predictor of real kernel latency.
   per-streaming-multiprocessor shared memory or L1 budget, not a value read from real device
   specifications or validated against a real kernel's actual SRAM usage, which also includes
   compiler-managed register allocation and other overheads not modeled here.
-- No real GPU kernel was run at any point in this project. All latency numbers reported above
-  are the cost model's own predictions, evaluated against itself; no correlation with real
-  measured hardware latency has been established.
+- No real GPU kernel has been run as of this writing. `validation/gpu/` contains a real,
+  configurable-tile-size Triton kernel and a benchmark intended to establish this correlation
+  (see [Phase 5's GPU validation subsection](#gpu-validation-triton-requires-cuda)), but it has
+  not yet been executed on a GPU. All latency numbers reported elsewhere in this document are the
+  cost model's own predictions, evaluated against itself, not measurements on real hardware.
 
 ## Workload and hardware assumptions
 
@@ -546,19 +554,47 @@ is a concrete instance of the same class of issue discussed in
 [Limitations](#limitations): the cost model is missing constraints that real hardware and real
 kernels have.
 
+### GPU validation (Triton, requires CUDA)
+
+`validation/gpu/` closes the gap the CPU demo above explicitly could not: a causal FlashAttention
+forward kernel written in Triton (`triton_flash_attention.py`), with `Br` and `Bc` exposed as
+real, configurable kernel launch parameters (`BLOCK_M` and `BLOCK_N`), plus a benchmark
+(`benchmark.py`) that measures its real forward-pass latency under the trained policy's
+recommended tile size versus a fixed naive tile size, and reports that alongside the cost model's
+predicted latency for the same two configurations. This is a forward-pass-only benchmark, not a
+full trainable model: the cost model in `tesseracts/attention-cost-model` only models forward-pass
+HBM traffic and compute, not a backward pass, so a forward-only measurement is what actually
+corresponds to what the cost model claims to predict, and it avoids needing a matching backward
+kernel, a substantially larger undertaking.
+
+Status: this code has been written and manually reviewed (kernel masking, the causal loop bound,
+and the batch/head stride flattening were traced through by hand), and syntax-checked, but it has
+not been executed, since no CUDA GPU was available in the environment it was developed in.
+`tests/gpu/test_triton_flash_attention.py` checks the kernel's output against a plain PyTorch
+reference implementation across several tile-size choices, including ones that do not evenly
+divide `seq_len` and one where the tile is larger than `seq_len`, and should be run before
+trusting anything `benchmark.py` reports.
+
+To run it on Google Colab's free GPU tier:
+
+1. Open a new notebook at [colab.research.google.com](https://colab.research.google.com), then
+   `Runtime` > `Change runtime type` > select a `T4 GPU`.
+2. Get the repository onto the Colab instance, either `git clone` from your remote if you have
+   pushed it, or upload the project as a zip and unzip it.
+3. Install dependencies: `pip install -r requirements.txt -r validation/gpu/requirements-gpu.txt`.
+   Colab's base image already has a C++ compiler, so no extra setup is needed to build the cost
+   model's shared library (see [Building and testing the cost model](#building-and-testing-the-cost-model)).
+4. Run the kernel correctness check first: `python -m pytest tests/gpu/ -v`. Do not proceed to
+   step 6 if this fails.
+5. Train a policy checkpoint if you do not already have one to upload:
+   `python -m policy.train --steps 1500 --batch-size 32`.
+6. Run the benchmark: `python -m validation.gpu.benchmark --checkpoint runs/<run_id>/policy_final.eqx`,
+   optionally passing `--seq-len`, `--head-dim`, `--num-heads`, and `--batch-size` to match a
+   specific workload shape.
+
 ## Future work
 
-A real GPU validation, training a small real transformer with tile sizes chosen by the trained
-policy actually driving a configurable-tile-size attention kernel, and comparing real measured
-throughput against a fixed baseline tiling, would validate whether this cost model's predictions
-correlate with real hardware behavior, which the CPU-only demo above does not and cannot
-establish. The most practical path is to use an existing tile-size-configurable attention
-implementation that exposes block-size arguments, rather than writing a custom Triton or CUDA
-kernel, and vary only those exposed knobs using the trained policy's recommendations, reporting
-real measured tokens per second or per-step wall-clock time against a fixed, untuned baseline
-tiling, on a GPU.
-
-Beyond that, giving `Bc` a direct, continuous effect on latency, for example by modeling reduced
+Beyond a real GPU validation (see above), giving `Bc` a direct, continuous effect on latency, for example by modeling reduced
 compute utilization from very small tiles, would let the policy learn a genuine per-workload
 `Bc` trend rather than the uniformly conservative value it currently converges to, as discussed
 in [What the policy learned](#what-the-policy-learned). Clamping `Br` to `seq_len` in the cost

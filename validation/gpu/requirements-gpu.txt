@@ -1,0 +1,7 @@
+# Extra dependencies for validation/gpu/, on top of the top-level
+# requirements.txt. Requires a CUDA GPU (developed for Colab's free T4
+# tier). torch already bundles a compatible triton on Linux+CUDA, but it
+# is listed explicitly here in case Colab's preinstalled torch build does
+# not include it.
+torch
+triton
