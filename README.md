@@ -18,8 +18,9 @@ grid search and random search baselines on held out workload shapes.
 8. [What the policy learned](#what-the-policy-learned)
 9. [Limitations](#limitations)
 10. [Workload and hardware assumptions](#workload-and-hardware-assumptions)
-11. [Future work](#future-work)
-12. [License](#license)
+11. [Phase 5: validation demo](#phase-5-validation-demo)
+12. [Future work](#future-work)
+13. [License](#license)
 
 ## Problem statement
 
@@ -178,13 +179,19 @@ tesseract-attn-autotune/
     grid_search.py                 Grid search baseline over a Triton-style tile grid
     random_search.py               Random search baseline over the continuous tile range
     compare.py                     Evaluations-vs-latency comparison and plot
-  validation/                      Real transformer training/throughput validation (not included)
+  validation/                      Phase 5: real transformer training and policy-shape wiring demo
+    tiny_transformer.py             Character-level GPT in JAX/Equinox, trained on TinyShakespeare
+    throughput_compare.py           Policy recommendation + cost-model prediction alongside real measured throughput
+    data/
+      tinyshakespeare.txt            Training data (public domain)
   tests/
     conftest.py                    Puts the repo root on sys.path for `policy.*` / `baselines.*` imports
     test_sample_workloads.py       Workload sampler and evaluation set tests
     test_model.py                  Policy MLP output-bounds and differentiability tests
     test_cost_model_wrapper.py     Tesseract A's Python wrapper tests, run through the real client
     test_baselines.py              Grid and random search baseline tests
+    test_integration.py            End-to-end training loop and checkpoint-progress tests
+    test_validation.py             Tiny GPT and policy-wiring tests for the Phase 5 demo
   docs/
     evals_vs_latency.png           Grid search vs. random search vs. trained policy, on held-out workloads
     training_progress.png          Policy's own mean held-out latency vs. cumulative training evaluations
@@ -251,6 +258,21 @@ For a containerized deployment, the equivalent call is `Tesseract.from_image("at
 against an image built with `tesseract build tesseracts/attention-cost-model`. `policy/train.py`
 isolates this choice in a single function, `make_cost_model_client()`, so switching from local
 execution to a built container image requires changing one line, not the training loop itself.
+This has been verified directly: `apply`, `jacobian`, `vector_jacobian_product`, and a full
+`jax.grad` through `apply_tesseract` all produce identical results against the built container as
+against the local client, including the analytically-checked partial derivative
+`d(predicted_latency_us)/d(Br) = -2.097152` at `Br = Bc = 64`, `seq_len = 2048`, `head_dim = 64`.
+
+One portability caveat surfaced by this check: `Tesseract.from_tesseract_api` runs entirely
+in-process, so a Python `set` passed as `jac_inputs`/`jac_outputs`/`vjp_inputs`/`vjp_outputs`
+works directly. `Tesseract.from_image` communicates over HTTP, and Python `set` objects are not
+JSON-serializable, so a direct call to `client.jacobian(...)` or
+`client.vector_jacobian_product(...)` against a containerized Tesseract needs a `list` instead.
+This only affects code that calls those endpoints directly (as in
+`tests/test_cost_model_wrapper.py`, which targets the local client); it does not affect
+`policy/train.py` or `baselines/*.py`, which either call `apply()` directly or go through
+`tesseract_jax.apply_tesseract`, which already formats its own requests correctly regardless of
+client type.
 
 ### Training the policy
 
@@ -278,9 +300,12 @@ python -m pytest tests/
 The test suite covers the workload sampler and evaluation sets (`tests/test_sample_workloads.py`),
 the policy MLP's output bounds and differentiability (`tests/test_model.py`), the cost model's
 Tesseract wrapper including the SRAM feasibility branch and its gradients
-(`tests/test_cost_model_wrapper.py`), and the grid and random search baselines
-(`tests/test_baselines.py`). The cost model's shared library must be built first (see
-[Building and testing the cost model](#building-and-testing-the-cost-model) above), since several
+(`tests/test_cost_model_wrapper.py`), the grid and random search baselines
+(`tests/test_baselines.py`), the training loop and checkpoint-progress evaluation end to end
+(`tests/test_integration.py`), and the Phase 5 validation demo
+(`tests/test_validation.py`), run for a handful of steps on small dimensions to stay fast. The
+cost model's shared library must be built first (see
+[Building and testing the cost model](#building-and-testing-the-cost-model) above), since most
 tests exercise the compiled model through the real Tesseract client rather than a mock.
 
 ### Running the baselines comparison
@@ -303,6 +328,22 @@ fine enough to actually capture how quickly the policy converges: with the defau
 [Training progress](#training-progress)), so `--checkpoint-every 100` or coarser will only
 capture checkpoints already at the converged optimum, differing from each other by floating point
 noise rather than by anything meaningful.
+
+### Running the validation demo
+
+```bash
+python -m validation.throughput_compare --checkpoint runs/<run_id>/policy_final.eqx --train-steps 100
+```
+
+This prints the trained policy's tile-size recommendation and the cost model's predicted latency
+for a small transformer's actual shape, alongside a real measured training run of that
+transformer on CPU. See [Phase 5: validation demo](#phase-5-validation-demo) for what this does
+and does not establish, and why. `validation/tiny_transformer.py` can also be run directly to
+train the same model without the tile-size comparison:
+
+```bash
+python -m validation.tiny_transformer --steps 200 --batch-size 32
+```
 
 ## Results
 
@@ -461,21 +502,68 @@ families rather than arbitrary ranges.
   `[16, 128]`, matching the range of tile sizes typically seen in Triton FlashAttention
   autotuning configurations.
 
+## Phase 5: validation demo
+
+`validation/` connects the trained policy to a real transformer's shape and trains that
+transformer for real, on CPU (no GPU was available in the environment this was developed in; see
+[Setup](#setup)). Its scope is deliberately limited to a correctness and wiring check, not a
+performance validation, for a specific reason: `validation/tiny_transformer.py` implements causal
+self-attention as a plain JAX einsum, which has no tile-size argument, since tiling is a GPU
+kernel implementation detail that a high-level dense attention operation does not expose.
+Changing the policy's recommended tile size cannot change this script's measured throughput at
+all. `validation/throughput_compare.py` reports two different kinds of numbers side by side
+without conflating them, and says so directly in its own output.
+
+A representative run, a 4-layer, 128-dimensional, 4-head character-level GPT (`head_dim = 32`)
+with `seq_len = 64` and `batch_size = 32`, trained on TinyShakespeare, produced:
+
+```
+Tiny transformer shape: seq_len=64, head_dim=32, num_heads=4, batch_size=32, hardware=A100-80GB
+
+--- Cost-model prediction (Tesseract A), not measured on real hardware ---
+Policy-recommended tile:  Br=128.00, Bc=16.38 -> predicted latency 0.7714 us
+Fixed naive tile:         Br=32, Bc=32 -> predicted latency 1.5428 us
+
+--- Real measured training run (validation/tiny_transformer.py, CPU, standard dense attention) ---
+Loss: 4.2961 -> 2.5172 over 100 steps
+Measured: 715.13 ms/step, 2864 tokens/sec
+```
+
+The cost-model prediction and the real measured throughput are both genuine, but only the first
+is a claim about tile sizes; the second is a plain measurement of a real training run that does
+not depend on tile size at all in this implementation. Together they demonstrate that a real
+transformer trains correctly with this project's stack, and that the trained policy produces a
+valid recommendation for a real model's actual shape, not that the recommended tile size makes
+real training faster, which would require a configurable-tile-size attention kernel and a GPU to
+run it on.
+
+This run also surfaced a real, previously unobserved limitation: the policy recommended
+`Br = 128` for a sequence of only 64 tokens, meaning its recommended row tile is larger than the
+sequence itself. The cost model has no constraint tying `Br` to `seq_len`, so nothing in training
+discourages this. A real kernel would clamp `Br` to `min(Br, seq_len)`, and doing so here would
+not change the qualitative result (larger `Br` remains latency-optimal up to that clamp), but it
+is a concrete instance of the same class of issue discussed in
+[Limitations](#limitations): the cost model is missing constraints that real hardware and real
+kernels have.
+
 ## Future work
 
-Training a small real transformer with tile sizes chosen by the trained policy, and comparing
-real measured throughput against a fixed baseline tiling, would validate whether this cost
-model's predictions correlate with real hardware behavior, which has not been established here.
-The most practical path is to use an existing tile-size-configurable attention implementation
-that exposes block-size arguments, rather than writing a custom Triton or CUDA kernel, and vary
-only those exposed knobs using the trained policy's recommendations for a small transformer's
-shape, reporting real measured tokens per second or per-step wall-clock time against a fixed,
-untuned baseline tiling.
+A real GPU validation, training a small real transformer with tile sizes chosen by the trained
+policy actually driving a configurable-tile-size attention kernel, and comparing real measured
+throughput against a fixed baseline tiling, would validate whether this cost model's predictions
+correlate with real hardware behavior, which the CPU-only demo above does not and cannot
+establish. The most practical path is to use an existing tile-size-configurable attention
+implementation that exposes block-size arguments, rather than writing a custom Triton or CUDA
+kernel, and vary only those exposed knobs using the trained policy's recommendations, reporting
+real measured tokens per second or per-step wall-clock time against a fixed, untuned baseline
+tiling, on a GPU.
 
 Beyond that, giving `Bc` a direct, continuous effect on latency, for example by modeling reduced
 compute utilization from very small tiles, would let the policy learn a genuine per-workload
 `Bc` trend rather than the uniformly conservative value it currently converges to, as discussed
-in [What the policy learned](#what-the-policy-learned).
+in [What the policy learned](#what-the-policy-learned). Clamping `Br` to `seq_len` in the cost
+model, per the finding above, would remove one concrete case where the current model's
+recommendation would not be physically sensible as a literal kernel configuration.
 
 ## License
 
