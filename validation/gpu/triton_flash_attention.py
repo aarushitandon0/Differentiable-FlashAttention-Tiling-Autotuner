@@ -99,11 +99,27 @@ def flash_attention_forward(
     block_m: int,
     block_n: int,
     sm_scale: float | None = None,
+    num_stages: int = 1,
+    num_warps: int = 4,
 ) -> torch.Tensor:
     """Causal FlashAttention forward pass with explicit tile sizes.
 
     q, k, v: (batch, num_heads, seq_len, head_dim), same shape, CUDA, fp16
     or bf16. Returns a tensor of the same shape.
+
+    num_stages controls Triton's software-pipelining depth, which trades
+    shared-memory usage for latency-hiding: each additional stage roughly
+    multiplies the kernel's shared-memory footprint. Triton's own default
+    (2 or 3, depending on version) works fine for the smaller tile sizes
+    typical of its tutorials, but at this project's larger tile sizes
+    (up to 128x128) it can exceed a real GPU's shared-memory budget well
+    before BLOCK_M/BLOCK_N alone would -- this is exactly the kind of
+    resource ceiling the cost model's SRAM-feasibility branch is a
+    simplified model of, just enforced by Triton's compiler instead of by
+    tesseracts/attention-cost-model's own arithmetic. num_stages=1 (no
+    pipelining) is the safest default; raise it for better performance on
+    GPUs with more shared memory per block, at the cost of failing to
+    compile sooner as tile sizes grow.
     """
     assert q.shape == k.shape == v.shape
     assert q.is_cuda, "This kernel requires a CUDA tensor; see the module docstring."
@@ -125,6 +141,7 @@ def flash_attention_forward(
         out.stride(1), out.stride(2), out.stride(3),
         seq_len, head_dim, sm_scale,
         BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_D=block_d,
+        num_stages=num_stages, num_warps=num_warps,
     )
     return out
 

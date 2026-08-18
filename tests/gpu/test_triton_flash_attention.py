@@ -16,7 +16,7 @@ and the README's Phase 5 section for how to run this on Colab.
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("triton")
+triton = pytest.importorskip("triton")
 
 from validation.gpu.triton_flash_attention import (  # noqa: E402
     flash_attention_forward,
@@ -39,7 +39,19 @@ def test_triton_matches_reference(seq_len, block_m, block_n):
     k = torch.randn(batch, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16)
     v = torch.randn(batch, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16)
 
-    out_triton = flash_attention_forward(q, k, v, block_m=block_m, block_n=block_n)
+    try:
+        out_triton = flash_attention_forward(q, k, v, block_m=block_m, block_n=block_n)
+    except triton.runtime.errors.OutOfResources as e:
+        # A real hardware shared-memory ceiling, not a correctness bug: this
+        # GPU's per-block shared memory is smaller than what this tile size
+        # needs even with num_stages=1 (no software pipelining). This is
+        # informative in its own right -- it is the literal GPU-enforced
+        # version of the SRAM-feasibility branch tesseracts/attention-cost-model
+        # models in software -- so it is reported as an expected failure
+        # rather than a hard test failure.
+        pytest.xfail(f"Tile size ({block_m}, {block_n}) exceeds this GPU's shared memory: {e}")
+        return
+
     out_ref = reference_attention_forward(q, k, v)
 
     torch.testing.assert_close(out_triton, out_ref, atol=2e-2, rtol=2e-2)

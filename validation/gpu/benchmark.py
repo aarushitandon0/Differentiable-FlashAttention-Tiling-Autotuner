@@ -30,8 +30,9 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp  # noqa: E402
 import torch  # noqa: E402
+import triton  # noqa: E402
 
-from baselines.common import evaluate_latency, make_client  # noqa: E402
+from baselines.common import make_client, workload_apply_inputs  # noqa: E402
 from policy.model import TilingPolicy  # noqa: E402
 from policy.sample_workloads import HARDWARE_PROFILES, TILE_SIZE_MIN, Workload  # noqa: E402
 from validation.gpu.triton_flash_attention import flash_attention_forward  # noqa: E402
@@ -57,10 +58,17 @@ def round_to_valid_block_size(x: float) -> int:
     return max(16, int(round(x / 16.0)) * 16)
 
 
-def measure_latency_us(fn, *args) -> float:
-    for _ in range(WARMUP_ITERS):
-        fn(*args)
-    torch.cuda.synchronize()
+def measure_latency_us(fn, *args) -> float | None:
+    """Returns mean measured latency in microseconds, or None if this tile
+    size does not fit in the GPU's shared memory (a real hardware limit,
+    not a bug; see triton_flash_attention.py's num_stages docstring).
+    """
+    try:
+        for _ in range(WARMUP_ITERS):
+            fn(*args)
+        torch.cuda.synchronize()
+    except triton.runtime.errors.OutOfResources:
+        return None
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -71,6 +79,10 @@ def measure_latency_us(fn, *args) -> float:
     torch.cuda.synchronize()
 
     return start.elapsed_time(end) * 1000.0 / TIMED_ITERS  # ms -> us, averaged
+
+
+def evaluate_cost_model(client, workload: Workload, br: float, bc: float) -> dict:
+    return client.apply(workload_apply_inputs(workload, br, bc))
 
 
 def main():
@@ -112,8 +124,14 @@ def main():
     print(f"Naive baseline: BLOCK_M=BLOCK_N={NAIVE_BLOCK}")
 
     client = make_client()
-    policy_predicted_us = evaluate_latency(client, workload, policy_block_m, policy_block_n)
-    naive_predicted_us = evaluate_latency(client, workload, NAIVE_BLOCK, NAIVE_BLOCK)
+    policy_cost = evaluate_cost_model(client, workload, policy_block_m, policy_block_n)
+    naive_cost = evaluate_cost_model(client, workload, NAIVE_BLOCK, NAIVE_BLOCK)
+    policy_predicted_us = float(policy_cost["predicted_latency_us"])
+    naive_predicted_us = float(naive_cost["predicted_latency_us"])
+    print(f"\nCost model's own SRAM-feasibility prediction: policy tile sram_utilization="
+          f"{float(policy_cost['sram_utilization']):.3f}, naive tile sram_utilization="
+          f"{float(naive_cost['sram_utilization']):.3f} (> 1.0 means the cost model predicts "
+          f"this tile does not fit in the assumed SRAM budget)")
 
     torch.manual_seed(0)
     shape = (args.batch_size, args.num_heads, args.seq_len, args.head_dim)
@@ -128,21 +146,35 @@ def main():
         flash_attention_forward, q, k, v, NAIVE_BLOCK, NAIVE_BLOCK
     )
 
+    def fmt(x):
+        return f"{x:14.3f}" if x is not None else f"{'N/A (OOM)':>14s}"
+
     print("\n--- Predicted (Tesseract A cost model) vs. measured (real Triton kernel, real GPU) ---")
     print(f"{'':25s} {'predicted us':>14s} {'measured us':>14s}")
-    print(f"{'Policy tile':25s} {policy_predicted_us:14.3f} {policy_measured_us:14.3f}")
-    print(f"{'Naive tile':25s} {naive_predicted_us:14.3f} {naive_measured_us:14.3f}")
+    print(f"{'Policy tile':25s} {policy_predicted_us:14.3f} {fmt(policy_measured_us)}")
+    print(f"{'Naive tile':25s} {naive_predicted_us:14.3f} {fmt(naive_measured_us)}")
 
-    predicted_speedup = naive_predicted_us / policy_predicted_us
-    measured_speedup = naive_measured_us / policy_measured_us
-    print(f"\nPredicted speedup (policy vs. naive): {predicted_speedup:.3f}x")
-    print(f"Measured speedup (policy vs. naive):   {measured_speedup:.3f}x")
-    print(
-        "\nThis is the real correlation check the CPU-only demo could not provide: whether the "
-        "cost model's predicted speedup direction and rough magnitude are reflected in a real "
-        "measured GPU kernel. It is still one workload shape on one GPU, not a validated general "
-        "correlation; see the README's Phase 5 section for how to read this result."
-    )
+    if policy_measured_us is None or naive_measured_us is None:
+        print(
+            "\nAt least one tile size did not fit in this GPU's shared memory even with "
+            "num_stages=1 (see triton_flash_attention.py). This is itself a real correlation "
+            "data point: check whether the cost model's sram_utilization above also predicted "
+            "infeasibility (> 1.0) for the same tile -- if so, the cost model's SRAM branch "
+            "correctly anticipated a real hardware limit, just a stricter one (this GPU's actual "
+            "shared-memory budget) than the SRAM budget this project's hardware profiles assume. "
+            "See the README's Limitations section."
+        )
+    else:
+        predicted_speedup = naive_predicted_us / policy_predicted_us
+        measured_speedup = naive_measured_us / policy_measured_us
+        print(f"\nPredicted speedup (policy vs. naive): {predicted_speedup:.3f}x")
+        print(f"Measured speedup (policy vs. naive):   {measured_speedup:.3f}x")
+        print(
+            "\nThis is the real correlation check the CPU-only demo could not provide: whether the "
+            "cost model's predicted speedup direction and rough magnitude are reflected in a real "
+            "measured GPU kernel. It is still one workload shape on one GPU, not a validated general "
+            "correlation; see the README's Phase 5 section for how to read this result."
+        )
 
 
 if __name__ == "__main__":
